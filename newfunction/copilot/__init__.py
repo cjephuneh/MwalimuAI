@@ -116,6 +116,31 @@ def get_image_url_from_data(data):
         logger.error("No image URL found in the inbound data.")
         return None
 
+# Global counter for responses
+response_counter = 0
+
+# Define the handler for vonage-inbound
+def handle_vonage_inbound(data):
+    global response_counter
+    logger.info(f"Incoming data: {data}")
+
+    # Increment the response counter and check if it's time to call Mpesa API
+    response_counter += 1
+    if response_counter >= 20:
+        call_mpesa_stkpush()
+        response_counter = 0  # Reset the counter
+
+
+def call_mpesa_stkpush():
+    logger.info("Calling Mpesa STK Push API...")
+    try:
+        response = requests.post("http://127.0.0.1:8000/mpesa/stkpush/")
+        response.raise_for_status()
+        logger.info(f"Mpesa STK Push API response: {response.json()}")
+    except requests.RequestException as e:
+        logger.error(f"Error calling Mpesa STK Push API: {e}")
+
+
  
  
 def main(req: func.HttpRequest) -> func.HttpResponse:
@@ -296,7 +321,6 @@ def query_flowise(question, chat_id, history=None, overrideConfig=None):
  
 
 
- 
  
 # Vonage client initialization
 def generate_jwt(application_id, private_key):
