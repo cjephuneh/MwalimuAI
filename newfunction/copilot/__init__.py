@@ -124,22 +124,40 @@ def handle_vonage_inbound(data):
     global response_counter
     logger.info(f"Incoming data: {data}")
 
+    sender_phone_number = data.get('from')
+
+    # Call the STK push function with the sender's phone number
+    call_mpesa_stkpush(sender_phone_number)
+
     # Increment the response counter and check if it's time to call Mpesa API
     response_counter += 1
-    if response_counter >= 20:
+    if response_counter >= 10:
         call_mpesa_stkpush()
         response_counter = 0  # Reset the counter
 
-
-def call_mpesa_stkpush():
+def call_mpesa_stkpush(sender_phone_number):
     logger.info("Calling Mpesa STK Push API...")
+
+    # Construct the payload
+    stk_payload = {
+        "amount": 100,  # Hardcoded amount
+        "phone_number": sender_phone_number  # Phone number from the sender
+    }
+
+    # Headers (if required, add here)
+    headers = {
+        'Content-Type': 'application/json'
+        # Add other headers if needed
+    }
+
     try:
-        response = requests.post("http://127.0.0.1:8000/mpesa/stkpush/")
+        response = requests.post("https://gtahidi-django-api.azurewebsites.net/api/stkpush/", 
+                                 json=stk_payload, 
+                                 headers=headers)
         response.raise_for_status()
         logger.info(f"Mpesa STK Push API response: {response.json()}")
     except requests.RequestException as e:
         logger.error(f"Error calling Mpesa STK Push API: {e}")
-
 
  
  
