@@ -145,13 +145,16 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
     
 # Initialization outside function to ensure it persists across invocations
 processed_message_uuids = set()
-response_counter = 0
+
+# Global variable to track the number of messages sent
+sent_messages_counter = 0
+
  
 
 
         # Define the handler for vonage-inbound
 async def handle_vonage_inbound(data):
-    global response_counter
+    global sent_messages_counter
     logger.info(f"Incoming data: {data}")
 
     try:
@@ -211,15 +214,7 @@ async def handle_vonage_inbound(data):
         else:
             logger.error(f"Unhandled message type: {message_type}")
             return func.HttpResponse("Message type not supported.", status_code=400)
-        # Check if it's time to call Mpesa API after handling the message
-        response_counter += 1
-        if response_counter >=100:
-            mpesa_response = await call_mpesa_stkpush(sender_phone_number)
-            if mpesa_response:
-                logger.info(f"Mpesa STK Push response: {mpesa_response}")
-            else:
-                logger.error("Failed to call Mpesa STK Push or did not receive a proper response.")
-            response_counter = 0     
+   
       
     except Exception as e:
             logger.error(f"Exception in handle_vonage_inbound: {e}")
@@ -230,28 +225,27 @@ async def handle_vonage_inbound(data):
     
 
 
-# Asynchronous function to call Mpesa STK push API with logging
-async def call_mpesa_stkpush(sender_phone_number):
+def call_mpesa_stkpush(sender_phone_number):
     stk_payload = {
-        "amount": 10,  # Hardcoded for demonstration, you might want to make this dynamic
+        "amount": 10,  # Or the desired amount
         "phone_number": sender_phone_number
     }
-    
-    # Log the payload before making the API call
-    logger.info(f"STK Push payload: {json.dumps(stk_payload)}")
 
     headers = {
         'Content-Type': 'application/json'
     }
 
-    # Make an asynchronous HTTP POST request to the Mpesa API
-    async with aiohttp.ClientSession() as session:
-        async with session.post(os.getenv('MPESA_API_URL'), headers=headers, json=stk_payload) as response:
-            # Await the response and log details
-            response_data = await response.json()
-            logger.info(f"STK Push response status: {response.status}")
-            logger.info(f"STK Push response data: {response_data}")
-            return response_data
+    # Use requests for synchronous call
+    try:
+        response = requests.post(os.getenv('MPESA_API_URL'), headers=headers, json=stk_payload)
+        response_data = response.json()
+        logger.info(f"STK Push response status: {response.status_code}")
+        logger.info(f"STK Push response data: {response_data}")
+        return response_data
+    except requests.RequestException as e:
+        logger.error(f"STK Push request failed: {e}")
+        return None
+
 
 
     
@@ -291,8 +285,10 @@ def generate_jwt(application_id, private_key):
     return token
 
 def send_whatsapp_message(to_number, text_message):
-    vonage_sandbox_number = "254769132469"  # Replaced with thw new number out of the sandbox
- 
+    global sent_messages_counter
+
+    vonage_sandbox_number = "254769132469"  # Replace with your Vonage number
+
     token = generate_jwt(VONAGE_APPLICATION_ID, VONAGE_PRIVATE_KEY)
 
     # Construct the headers and payload
@@ -307,16 +303,32 @@ def send_whatsapp_message(to_number, text_message):
         "text": text_message,
         "channel": "whatsapp"
     }
- 
+
     # Log the payload for debugging purposes
     logger.info(f"Sending payload to Vonage API: {payload}")
+    
     response = requests.post(VONAGE_MESSAGES_API_URL, headers=headers, json=payload)
+    
     if response.status_code == 202:
         message_uuid = response.json().get("message_uuid")
         logger.info(f"Message accepted by Vonage, UUID: {message_uuid}")
-        # You can store `message_uuid` for further tracking if needed
+        
+        sent_messages_counter += 1
+        logger.info(f"Message sent. Incrementing sent_messages_counter to {sent_messages_counter}")
+
+        # Check if it's time to call Mpesa API after handling the message
+        logger.info(f"Checking if Mpesa STK Push should be triggered. Counter value: {sent_messages_counter}")
+        if sent_messages_counter >= 1001:  # Or any other threshold you define
+            logger.info("Triggering Mpesa STK Push.")
+            mpesa_response = call_mpesa_stkpush(to_number)
+            if mpesa_response:
+                logger.info(f"Mpesa STK Push response: {mpesa_response}")
+            else:
+                logger.error("Failed to call Mpesa STK Push or did not receive a proper response.")
+            sent_messages_counter = 0  # Reset the counter
     else:
         logger.error(f"Failed to send message via Vonage, Status Code: {response.status_code}, Response Body: {response.text}")
+
 
 
 async def query_flowise(question, chat_id, history=None, overrideConfig=None):
@@ -345,6 +357,3 @@ async def query_flowise(question, chat_id, history=None, overrideConfig=None):
     except Exception as e:
         logger.error(f"Error querying Flowise: {e}")
         return "There Was an error processing your request due to high demand, please try again later"
-
-
-        
