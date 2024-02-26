@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
  
 # Vonage and Flowise configuration
 
-VONAGE_MESSAGES_API_URL = "https://api.nexmo.com/v1/messages"
+VONAGE_MESSAGES_API_URL = os.getenv('VONAGE_MESSAGES')
 VONAGE_APPLICATION_ID = os.getenv('VONAGE_APPLICATION_ID')
 
 FLOWISE_API_URL = "http://20.8.140.23:3000/api/v1/prediction/ab912ece-da19-4721-ba72-6acd787adead"
@@ -287,7 +287,7 @@ def generate_jwt(application_id, private_key):
 def send_whatsapp_message(to_number, text_message):
     global sent_messages_counter
 
-    vonage_sandbox_number = "254769132469"  # Replace with your Vonage number
+    vonage_sandbox_number = os.getenv('WHATSAPP_TO_NUMBER')  # Replace with your Vonage number
 
     token = generate_jwt(VONAGE_APPLICATION_ID, VONAGE_PRIVATE_KEY)
 
