@@ -1,6 +1,5 @@
 ## vonage main running application
 
-
 import azure.functions as func
 import os
 
