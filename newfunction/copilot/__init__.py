@@ -14,23 +14,40 @@ from functools import lru_cache
 import aiohttp
 import asyncio
 import requests
+from .countermanager import TableStorageManager
+
+
  
 # Set up logging
 logger = logging.getLogger(__name__)
+
+# Initialize the TableStorageManager
+connection_string = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
+try:
+    table_manager = TableStorageManager(connection_string, "MessageCounter")
+    logger.info("Connected to Azure Table Storage successfully.")
+except Exception as e:
+    logger.error("Failed to initialize Table Storage: ", exc_info=True)
+
+
+MESSAGE_THRESHOLD = 55 
  
 # Vonage and Flowise configuration
 
-VONAGE_MESSAGES_API_URL = os.getenv('VONAGE_MESSAGES')
+VONAGE_MESSAGES_API_URL = "https://api.nexmo.com/v1/messages"
 VONAGE_APPLICATION_ID = os.getenv('VONAGE_APPLICATION_ID')
 
-FLOWISE_API_URL = "http://20.8.140.23:3000/api/v1/prediction/ab912ece-da19-4721-ba72-6acd787adead"
+FLOWISE_API_URL = os.getenv('FLOWISE_API_URL')
  
 # Path to private key file
 PRIVATE_KEY_FILE_PATH = '/home/site/wwwroot/copilot/private.pem'
 
+
 # Load the Private Key from file
 def load_private_key_from_file(file_path):
-    with open(file_path, 'r') as pem_file:
+    # Construct the full path using the current file's directory
+    full_path = os.path.abspath(os.path.join(os.path.dirname(__file__), file_path))
+    with open(full_path, 'r') as pem_file:
         private_key = pem_file.read()
     return private_key
 
@@ -92,8 +109,8 @@ async def process_image_with_azure_ai(image_url):
             # You can extend the messages list if you need other interactions
         ],
         "temperature": 0.7,
-        "top_p": 0.95,
-        "max_tokens": 800
+        "top_p": 0.9,
+        "max_tokens": 500
     }
     
     # Send POST request to the Azure endpoint and return the analyzed result
@@ -146,15 +163,13 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
 # Initialization outside function to ensure it persists across invocations
 processed_message_uuids = set()
 
-# Global variable to track the number of messages sent
-sent_messages_counter = 0
 
  
 
 
         # Define the handler for vonage-inbound
 async def handle_vonage_inbound(data):
-    global sent_messages_counter
+    
     logger.info(f"Incoming data: {data}")
 
     try:
@@ -167,11 +182,14 @@ async def handle_vonage_inbound(data):
 
         processed_message_uuids.add(message_uuid)
 
+                # Retrieve the message count from the table storage
+        count = table_manager.get_message_count(sender_phone_number)
+
         message_type = data.get('message_type')
         if message_type is None:
-            logger.warning("Received message with no type.")
-            return func.HttpResponse("Message type is undefined", status_code=400)
-
+            logger.info("Received message with no type, possibly from Flowise.")
+            return func.HttpResponse("No action needed for no-type message", status_code=200)
+    
         if message_type == 'image':
             image_url = get_image_url_from_data(data)
             if image_url:
@@ -194,22 +212,26 @@ async def handle_vonage_inbound(data):
 
         elif message_type == 'text':
             incoming_msg = data.get('text', '')
+            # Check if the message threshold is reached
+            if count >= MESSAGE_THRESHOLD:
+                # If threshold is reached, handle accordingly
+                return handle_threshold_exceeded(sender_phone_number)
+
+            # If threshold not reached, handle the text message and update the count
             flowise_response = await query_flowise(incoming_msg, sender_phone_number)
-
-            if isinstance(flowise_response, dict) and "value" in flowise_response:
-                response_message = flowise_response["value"]
-            else:
-                response_message = flowise_response
-
-            if response_message:
-                send_whatsapp_message(sender_phone_number, response_message)
+            if isinstance(flowise_response, str): 
+# Here is where you should log and send the message
+                logger.info(f"Sending Flowise response to WhatsApp: {flowise_response}")
+                send_whatsapp_message(sender_phone_number, flowise_response)
+                table_manager.update_message_count(sender_phone_number, count + 1)
                 return func.HttpResponse(
-                    json.dumps({"status": "success", "response_from_flowise": response_message}),
+                    json.dumps({"status": "success", "response_from_flowise": flowise_response}),
                     status_code=200,
                     mimetype="application/json"
                 )
             else:
-                return func.HttpResponse("Failed to process text message.", status_code=500)
+                logger.error("Failed to process text message.")
+
 
         else:
             logger.error(f"Unhandled message type: {message_type}")
@@ -222,33 +244,7 @@ async def handle_vonage_inbound(data):
             return func.HttpResponse(error_message, status_code=500)
     
     return func.HttpResponse("Message processed successfully", status_code=200)
-    
 
-
-def call_mpesa_stkpush(sender_phone_number):
-    stk_payload = {
-        "amount": 10,  # Or the desired amount
-        "phone_number": sender_phone_number
-    }
-
-    headers = {
-        'Content-Type': 'application/json'
-    }
-
-    # Use requests for synchronous call
-    try:
-        response = requests.post(os.getenv('MPESA_API_URL'), headers=headers, json=stk_payload)
-        response_data = response.json()
-        logger.info(f"STK Push response status: {response.status_code}")
-        logger.info(f"STK Push response data: {response_data}")
-        return response_data
-    except requests.RequestException as e:
-        logger.error(f"STK Push request failed: {e}")
-        return None
-
-
-
-    
 
 async def notify_flowise_image_processing(notification_message, sender_phone_number, image_analysis=None):
     payload = {"chatId": sender_phone_number}
@@ -271,6 +267,89 @@ async def notify_flowise_image_processing(notification_message, sender_phone_num
             return None
 
     
+
+
+def call_mpesa_stkpush(sender_phone_number):
+    stk_payload = {
+  "phone_number": sender_phone_number
+}
+
+    headers = {
+        'Content-Type': 'application/json'
+    }
+
+    # Use requests for synchronous call
+    try:
+        response = requests.post(os.getenv('MPESA_API_URL'), headers=headers, json=stk_payload)
+        response_data = response.json()
+        logger.info(f"STK Push response status: {response.status_code}")
+        logger.info(f"STK Push response data: {response_data}")
+        return response_data
+    except requests.RequestException as e:
+        logger.error(f"STK Push request failed: {e}")
+        return None
+    
+
+def check_mpesa_stkpush_status(invoice_id):
+    stk_payload = {
+  "invoice_id": invoice_id
+}
+
+    headers = {
+        'Content-Type': 'application/json'
+    }
+
+    # Use requests for synchronous call
+    try:
+        response = requests.post(os.getenv('MPESA_CHECK_URL'), headers=headers, json=stk_payload)
+        response_data = response.json()
+        logger.info(f"STK Push response status: {response.status_code}")
+        logger.info(f"STK Push response data: {response_data}")
+        return response_data
+    except requests.RequestException as e:
+        logger.error(f"STK Push request failed: {e}")
+        return None    
+
+
+
+
+def handle_threshold_exceeded(number):
+    logger.info(f"Threshold reached for {number}. Triggering Mpesa STK Push.")
+
+    # Call STK Push API
+    mpesa_response = call_mpesa_stkpush(number)
+
+    if mpesa_response and 'invoice' in mpesa_response and 'invoice_id' in mpesa_response['invoice']:
+        invoice_id = mpesa_response['invoice']['invoice_id']
+
+        max_tries = 3
+        count = 0
+
+        # Introducing initial 15-second delay before first status check
+        time.sleep(15)
+
+        while count < max_tries:   # Start continuous polling, upto max_tries
+            payment_status_response = check_mpesa_stkpush_status(invoice_id)
+            state = payment_status_response['invoice']['state']
+
+            if state == 'COMPLETE':  # If payment is complete
+                table_manager.reset_message_count(number) # Reset counter
+                return 'Payment completed. You can resume conversation.'
+            elif state == 'RETRY' or state == 'FAILED':  # If payment has failed
+                # Don't reset counter
+                return 'Your payment failed. Please try sending another message to retry the payment.'
+            elif state == 'PENDING':  # If payment is still processing
+                count += 1  # Increment the count only after first check
+
+                if count < max_tries:
+                    time.sleep(2)  # Pausing execution for 5 seconds for next check
+                continue
+                
+        # If exceeded max_tries and payment is still not complete  
+        return 'Your payment attempt is taking longer than usual. Please check your Mpesa messages.'
+    else:
+        return 'Failed to initiate payment. Please try again.'
+    
  
  
 # Vonage client initialization
@@ -285,17 +364,60 @@ def generate_jwt(application_id, private_key):
     return token
 
 def send_whatsapp_message(to_number, text_message):
-    global sent_messages_counter
+    WHITELIST = set(os.getenv('WHITELIST', '').split(','))
 
-    vonage_sandbox_number = os.getenv('WHATSAPP_TO_NUMBER')  # Replace with your Vonage number
-
+    vonage_sandbox_number = "254769132469"  # Replace with your Vonage number
     token = generate_jwt(VONAGE_APPLICATION_ID, VONAGE_PRIVATE_KEY)
-
-    # Construct the headers and payload
+    
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {token}',
     }
+
+    # Fetch the current message count from Azure Table Storage
+    count = table_manager.get_message_count(to_number)
+    message_threshold = MESSAGE_THRESHOLD if to_number in WHITELIST else 7
+
+    if count >= message_threshold:
+        if to_number in WHITELIST:
+            # Custom message for whitelisted users when they reach 5 messages
+            notification_msg = ("Hello! 👋\n"
+                                "Thank you for participating in our trial. You have reached 50 messages. "
+                                "Please contact 254706601809 for your reward before you continue. "
+                                "This will allow us to go through the conversation for analysis. "
+                                "Share this message as proof. Thank you for your support!")
+        else:
+            # Standard message for non-whitelisted users when they reach 7 messages
+            notification_msg = ("Hello! 👋\n"
+                                "Thanks for using gTahidi! You've reached your free message limit of "
+                                f"{message_threshold} messages. To keep enjoying our services, please "
+                                "complete a small payment of 20 shillings via M-Pesa.\n"
+                                "Ensure your WhatsApp number is linked to your M-Pesa account. Need help? "
+                                "Call our support team at +254726278575.\n"
+                                "Thank you for your support!")
+
+        payload = {
+            "from": vonage_sandbox_number,
+            "to": to_number,
+            "message_type": "text",
+            "text": notification_msg,
+            "channel": "whatsapp"
+        }
+
+        logger.info(f"Vonage payload: {payload}")
+        
+        # Send the threshold notification message via Vonage
+        response = requests.post(VONAGE_MESSAGES_API_URL, headers=headers, json=payload)
+        if response.status_code != 202:
+            logger.error(f"Failed to send threshold notification to {to_number}, Status Code: {response.status_code}, Response Body: {response.text}")
+
+        # Log that the threshold message was sent
+        logger.info(f"Threshold notification sent to {to_number}. Message: {notification_msg}")
+
+        # Do not proceed with further message sending since the threshold message has been sent
+        return
+
+    # If threshold not reached, proceed to send the message
     payload = {
         "from": vonage_sandbox_number,
         "to": to_number,
@@ -303,31 +425,17 @@ def send_whatsapp_message(to_number, text_message):
         "text": text_message,
         "channel": "whatsapp"
     }
-
-    # Log the payload for debugging purposes
-    logger.info(f"Sending payload to Vonage API: {payload}")
     
     response = requests.post(VONAGE_MESSAGES_API_URL, headers=headers, json=payload)
-    
     if response.status_code == 202:
         message_uuid = response.json().get("message_uuid")
         logger.info(f"Message accepted by Vonage, UUID: {message_uuid}")
-        
-        sent_messages_counter += 1
-        logger.info(f"Message sent. Incrementing sent_messages_counter to {sent_messages_counter}")
-
-        # Check if it's time to call Mpesa API after handling the message
-        logger.info(f"Checking if Mpesa STK Push should be triggered. Counter value: {sent_messages_counter}")
-        if sent_messages_counter >= 1001:  # Or any other threshold you define
-            logger.info("Triggering Mpesa STK Push.")
-            mpesa_response = call_mpesa_stkpush(to_number)
-            if mpesa_response:
-                logger.info(f"Mpesa STK Push response: {mpesa_response}")
-            else:
-                logger.error("Failed to call Mpesa STK Push or did not receive a proper response.")
-            sent_messages_counter = 0  # Reset the counter
+        table_manager.update_message_count(to_number, count + 1)
     else:
-        logger.error(f"Failed to send message via Vonage, Status Code: {response.status_code}, Response Body: {response.text}")
+        logger.error(f"Failed to send message via Vonage to {to_number}, Status Code: {response.status_code}, Response Body: {response.text}")
+
+
+
 
 
 
@@ -344,16 +452,21 @@ async def query_flowise(question, chat_id, history=None, overrideConfig=None):
 
     headers = {"Content-Type": "application/json"}
 
+    logger.info(f"Payload for Flowise: {payload}")
+
     try:
         response_data = await async_post_with_aiohttp(FLOWISE_API_URL, payload, headers)
         logger.info(f"Response from Flowise: {response_data}")
         
-        messages = response_data.get('assistant', {}).get('messages', [])
-        if messages:
-            answer_section = messages[0].get('content', [{}])[0].get('text', 'Sorry, I could not process your request.')
-            return answer_section
-        else:
-            return 'Sorry, I could not process your request.' 
+        # Attempt to extract the first assistant message with text content
+        if 'assistant' in response_data and 'messages' in response_data['assistant']:
+            for message in response_data['assistant']['messages']:
+                if message['role'] == 'assistant' and 'content' in message and message['content']:
+                    for content in message['content']:
+                        if 'text' in content and 'value' in content['text']:
+                            return content['text']['value']
+
+        return 'Sorry, I could not process your request.'  # Default response if no suitable message is found
     except Exception as e:
         logger.error(f"Error querying Flowise: {e}")
-        return "There Was an error processing your request due to high demand, please try again later"
+        return "We are currently updating our systems to accommodate all of you, please check in later"
