@@ -213,9 +213,7 @@ async def handle_vonage_inbound(data):
         elif message_type == 'text':
             incoming_msg = data.get('text', '')
             # Check if the message threshold is reached
-            if count >= MESSAGE_THRESHOLD:
-                # If threshold is reached, handle accordingly
-                return handle_threshold_exceeded(sender_phone_number)
+
 
             # If threshold not reached, handle the text message and update the count
             flowise_response = await query_flowise(incoming_msg, sender_phone_number)
@@ -321,34 +319,53 @@ def handle_threshold_exceeded(number):
 
     if mpesa_response and 'invoice' in mpesa_response and 'invoice_id' in mpesa_response['invoice']:
         invoice_id = mpesa_response['invoice']['invoice_id']
-
         max_tries = 3
         count = 0
 
         # Introducing initial 15-second delay before first status check
         time.sleep(15)
 
-        while count < max_tries:   # Start continuous polling, upto max_tries
+        while count < max_tries:
             payment_status_response = check_mpesa_stkpush_status(invoice_id)
             state = payment_status_response['invoice']['state']
 
-            if state == 'COMPLETE':  # If payment is complete
-                table_manager.reset_message_count(number) # Reset counter
-                return 'Payment completed. You can resume conversation.'
-            elif state == 'RETRY' or state == 'FAILED':  # If payment has failed
-                # Don't reset counter
+            if state == 'COMPLETE':
+                logger.info(f"Payment complete for {number}, resetting message count.")
+                if table_manager.reset_message_count(number):
+                    logger.info(f"Message count reset for {number}. Sending confirmation message.")
+                    send_whatsapp_message(number, "Payment completed. You can resume the conversation.")
+                    logger.info("Confirmation message sent.")
+                    return 'Payment completed. You can resume conversation.'
+                else:
+                    logger.error("Failed to reset message count.")
+            elif state == 'RETRY' or state == 'FAILED':
+                send_whatsapp_message(number, "Payment failed try sending another message to retry the payment.")
                 return 'Your payment failed. Please try sending another message to retry the payment.'
-            elif state == 'PENDING':  # If payment is still processing
-                count += 1  # Increment the count only after first check
-
+            elif state == 'PENDING':
+                count += 1
                 if count < max_tries:
-                    time.sleep(2)  # Pausing execution for 5 seconds for next check
-                continue
-                
-        # If exceeded max_tries and payment is still not complete  
+                    time.sleep(2)  # Pausing execution for next check
+            else:
+                logger.info("Unhandled payment state.")
+        
+        logger.info("Exceeded maximum number of tries for payment status checks.")
         return 'Your payment attempt is taking longer than usual. Please check your Mpesa messages.'
     else:
+        logger.error("Failed to initiate payment.")
         return 'Failed to initiate payment. Please try again.'
+    
+
+def reset_message_count(self, phone_number):
+    try:
+        entity = self.table_service.get_entity('MessageCounter', 'PartitionKey', phone_number, 'RowKey', phone_number)
+        entity.MessageCount = 0
+        self.table_service.update_entity('MessageCounter', entity)
+        logger.info(f"Message count successfully reset for {phone_number}.")
+    except Exception as e:
+        logger.error(f"Failed to reset message count for {phone_number}: {e}", exc_info=True)
+        return False
+    return True
+
     
  
  
@@ -415,7 +432,7 @@ def send_whatsapp_message(to_number, text_message):
         logger.info(f"Threshold notification sent to {to_number}. Message: {notification_msg}")
 
         # Do not proceed with further message sending since the threshold message has been sent
-        return
+        return handle_threshold_exceeded(to_number)
 
     # If threshold not reached, proceed to send the message
     payload = {
