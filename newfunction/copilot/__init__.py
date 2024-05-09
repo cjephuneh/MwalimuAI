@@ -182,8 +182,6 @@ async def handle_vonage_inbound(data):
 
         processed_message_uuids.add(message_uuid)
 
-                # Retrieve the message count from the table storage
-        count = table_manager.get_message_count(sender_phone_number)
 
         message_type = data.get('message_type')
         if message_type is None:
@@ -221,7 +219,6 @@ async def handle_vonage_inbound(data):
 # Here is where you should log and send the message
                 logger.info(f"Sending Flowise response to WhatsApp: {flowise_response}")
                 send_whatsapp_message(sender_phone_number, flowise_response)
-                table_manager.update_message_count(sender_phone_number, count + 1)
                 return func.HttpResponse(
                     json.dumps({"status": "success", "response_from_flowise": flowise_response}),
                     status_code=200,
@@ -322,7 +319,7 @@ def handle_threshold_exceeded(number):
         max_tries = 3
         count = 0
 
-        # Introducing initial 15-second delay before first status check
+        # Initial delay before first status check
         time.sleep(15)
 
         while count < max_tries:
@@ -332,39 +329,38 @@ def handle_threshold_exceeded(number):
             if state == 'COMPLETE':
                 logger.info(f"Payment complete for {number}, resetting message count.")
                 if table_manager.reset_message_count(number):
-                    logger.info(f"Message count reset for {number}. Sending confirmation message.")
                     send_whatsapp_message(number, "Payment completed. You can resume the conversation.")
+                    table_manager.set_notification_sent(number, sent=False)
                     logger.info("Confirmation message sent.")
                     return 'Payment completed. You can resume conversation.'
                 else:
                     logger.error("Failed to reset message count.")
+                    break
+
             elif state == 'RETRY' or state == 'FAILED':
-                send_whatsapp_message(number, "Payment failed try sending another message to retry the payment.")
+                if not table_manager.is_notification_sent(number):
+                    send_whatsapp_message(number, "Payment failed. Try sending another message to retry the payment.")
+                    table_manager.set_notification_sent(number, sent=True)
                 return 'Your payment failed. Please try sending another message to retry the payment.'
+
             elif state == 'PENDING':
                 count += 1
                 if count < max_tries:
-                    time.sleep(2)  # Pausing execution for next check
+                    time.sleep(5)  # Pause for next check
             else:
                 logger.info("Unhandled payment state.")
         
-        logger.info("Exceeded maximum number of tries for payment status checks.")
+        if count == max_tries:
+            logger.info("Exceeded maximum number of tries for payment status checks.")
+            send_whatsapp_message(number, "Your payment attempt is taking longer than usual. Please check your Mpesa messages.")
+            table_manager.set_notification_sent(number, sent=True)
         return 'Your payment attempt is taking longer than usual. Please check your Mpesa messages.'
     else:
         logger.error("Failed to initiate payment.")
         return 'Failed to initiate payment. Please try again.'
     
 
-def reset_message_count(self, phone_number):
-    try:
-        entity = self.table_service.get_entity('MessageCounter', 'PartitionKey', phone_number, 'RowKey', phone_number)
-        entity.MessageCount = 0
-        self.table_service.update_entity('MessageCounter', entity)
-        logger.info(f"Message count successfully reset for {phone_number}.")
-    except Exception as e:
-        logger.error(f"Failed to reset message count for {phone_number}: {e}", exc_info=True)
-        return False
-    return True
+
 
     
  
@@ -396,43 +392,48 @@ def send_whatsapp_message(to_number, text_message):
     message_threshold = MESSAGE_THRESHOLD if to_number in WHITELIST else 7
 
     if count >= message_threshold:
-        if to_number in WHITELIST:
-            # Custom message for whitelisted users when they reach 5 messages
-            notification_msg = ("Hello! 👋\n"
-                                "Thank you for participating in our trial. You have reached 50 messages. "
-                                "Please contact 254706601809 for your reward before you continue. "
-                                "This will allow us to go through the conversation for analysis. "
-                                "Share this message as proof. Thank you for your support!")
-        else:
-            # Standard message for non-whitelisted users when they reach 7 messages
-            notification_msg = ("Hello! 👋\n"
-                                "Thanks for using gTahidi! You've reached your free message limit of "
-                                f"{message_threshold} messages. To keep enjoying our services, please "
-                                "complete a small payment of 20 shillings via M-Pesa.\n"
-                                "Ensure your WhatsApp number is linked to your M-Pesa account. Need help? "
-                                "Call our support team at +254726278575.\n"
-                                "Thank you for your support!")
-
-        payload = {
-            "from": vonage_sandbox_number,
-            "to": to_number,
-            "message_type": "text",
-            "text": notification_msg,
-            "channel": "whatsapp"
-        }
-
-        logger.info(f"Vonage payload: {payload}")
+        if not table_manager.is_notification_sent(to_number):  # Check if notification has already been sent
         
-        # Send the threshold notification message via Vonage
-        response = requests.post(VONAGE_MESSAGES_API_URL, headers=headers, json=payload)
-        if response.status_code != 202:
-            logger.error(f"Failed to send threshold notification to {to_number}, Status Code: {response.status_code}, Response Body: {response.text}")
+            if to_number in WHITELIST:
+                # Custom message for whitelisted users when they reach 5 messages
+                notification_msg = ("Hello! 👋\n"
+                                    "Thank you for participating in our trial. You have reached 50 messages. "
+                                    "Please contact 254706601809 for your reward before you continue. "
+                                    "This will allow us to go through the conversation for analysis. "
+                                    "Share this message as proof. Thank you for your support!")
+            else:
+                # Standard message for non-whitelisted users when they reach 7 messages
+                notification_msg = ("Hello! 👋\n"
+                                    "Thanks for using gTahidi! You've reached your free message limit of "
+                                    f"{message_threshold} messages. To keep enjoying our services, please "
+                                    "complete a small payment of 20 shillings via M-Pesa.\n"
+                                    "Ensure your WhatsApp number is linked to your M-Pesa account. Need help? "
+                                    "Call our support team at +254726278575.\n"
+                                    "Thank you for your support!")
 
-        # Log that the threshold message was sent
-        logger.info(f"Threshold notification sent to {to_number}. Message: {notification_msg}")
+            payload = {
+                "from": vonage_sandbox_number,
+                "to": to_number,
+                "message_type": "text",
+                "text": notification_msg,
+                "channel": "whatsapp"
+            }
 
-        # Do not proceed with further message sending since the threshold message has been sent
-        return handle_threshold_exceeded(to_number)
+            logger.info(f"Vonage payload: {payload}")
+            
+            # Send the threshold notification message via Vonage
+            response = requests.post(VONAGE_MESSAGES_API_URL, headers=headers, json=payload)
+            if response.status_code != 202:
+                table_manager.set_notification_sent(to_number, sent=True)
+                logger.error(f"Failed to send threshold notification to {to_number}, Status Code: {response.status_code}, Response Body: {response.text}")
+            
+            # Log that the threshold message was sent
+            logger.info(f"Threshold notification sent to {to_number}. Message: {notification_msg}")
+
+            table_manager.set_notification_sent(to_number, sent=True)
+
+            # Do not proceed with further message sending since the threshold message has been sent
+            return handle_threshold_exceeded(to_number)
 
     # If threshold not reached, proceed to send the message
     payload = {
